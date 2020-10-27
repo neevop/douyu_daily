@@ -1,91 +1,181 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-import multiprocessing
+# -*- coding:utf-8 -*-
 import socket
+import sys
 import time
-import re
+import uuid
+import hashlib
 import requests
-from bs4 import BeautifulSoup
-import json
+import re
+import sys
+import threading
+import copy
+import struct
 
-# config socket ip and port
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-host = socket.gethostbyname("danmuproxy.douyu.com")
-port = 8506
-client.connect((host, port))
+reload(sys)
+sys.setdefaultencoding('gb18030')
 
-# 获取用户昵称及弹幕信息的正则表达式
-danmu = re.compile(b'type@=chatmsg.*?/nn@=(.*?)/txt@=(.*?)/')
-
-
-def sendmsg(msgstr):
-    '''
-    msgHead: head of protol
-    '''
-    msg = msgstr.encode('utf-8')
-    data_length = len(msg) + 8
-    code = 689
-    msgHead = int.to_bytes(data_length, 4, 'little') \
-              + int.to_bytes(data_length, 4, 'little') + int.to_bytes(code, 4, 'little')
-    client.send(msgHead)
-    sent = 0
-    while sent < len(msg):
-        tn = client.send(msg[sent:])
-        sent = sent + tn
+global users
+global passes
+global realname
 
 
-def start(roomid):
-    '''
-    send login request
-    '''
-    msg = 'type@=loginreq/roomid@={}/\0'.format(roomid)
-    sendmsg(msg)
-    msg_more = 'type@=joingroup/rid@={}/gid@=-9999/\0'.format(roomid)
-    sendmsg(msg_more)
+realname=[]
+users=[]
+passes=[]
 
-    print('---------------get-danmu-messages--------------'.format(get_name(roomid)))
-    while True:
-        data = client.recv(1024)
-        danmu_more = danmu.findall(data)
-        if not data:
-            break
+def staticGet(idolid):
+    hea = {'User-Agent':'Mozilla/5.0 (Windows NT 6.3; Win64; x64)\
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.118 Safari/537.36'}
+    url='http://www.douyutv.com/'+idolid
+    print('connect url:',url)
+    html = requests.get(url,headers = hea).text
+    roomid = "".join(re.findall('task_roomid" value="(\d+)',html))
+    titleStr = "".join(re.findall('"server_config":"%5B%7B(.*?)%7D%5D","def_disp_gg":0};',html))
+    titleStr = re.sub('%22','',titleStr)
+    listTitle = titleStr.split('%7D%2C%7B')
+    print(titleStr)
+    logServer=dict()
+    logServer['port']=[]
+    logServer['ip']=[]
+    for i in range(len(listTitle)):  
+        logServer['port'].append(re.findall('%2Cport%3A(\d+)',listTitle[i])[0])
+        logServer['ip'].append(re.findall('ip%3A(.*?)%2C',listTitle[i])[0])
+        logServer['rid']=roomid
+    #print('Logserver,port:',logServer['port'],'ip:',logServer['ip'],'rid:',logServer['rid'])
+    return logServer
+
+
+def danmuServerGet(sockStr):
+    contextList=sockStr.split(b'\x00"')[0].split(b'\xb2\x02')
+    danmuServer=dict()
+    for cl in contextList:
+        cl=cl.decode('utf-8','.ignore')
+        if re.search('msgrepeaterlist',cl):
+            danmuServer['add']=re.findall('Sip@AA=(.*?)@',cl)
+            danmuServer['port']=re.findall('Sport@AA=(\d+)',cl)
+        elif re.search('setmsggroup',cl):
+            danmuServer['gid']=re.findall('gid@=(\d+)/',cl)
+            danmuServer['rid']=re.findall('rid@=(.*?)/',cl)
+    #print('danmuServer adress:',danmuServer['add'][0],danmuServer['port'][0],'groupID:',danmuServer['gid'])
+    return danmuServer
+
+def sendmsg(sock,msgstr) :
+    msg=msgstr
+    data_length= len(msg)+8
+    code=689
+    #msgHead=int.to_bytes(data_length,4,'little')+int.to_bytes(data_length,4,'little')+int.to_bytes(code,4,'little')
+    msgHead=struct.pack("<l",data_length)+struct.pack("<l",data_length)+struct.pack("<l",code)
+    sock.send(msgHead)
+    sent=0
+    while sent<len(msg):
+        tn= sock.send(msg[sent:])
+        sent= sent + tn
+
+
+def dynamicGet(logServer):
+    sock=[]
+    sucnum=0
+    for num in range(len(users)):
+        lognum=num % len(logServer['ip'])
+        sock.append(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        sock[num].connect((logServer['ip'][lognum], int(logServer['port'][lognum])))
+        devid=uuid.uuid1().hex.swapcase()
+        rt=str(int(time.time()))
+        hashvk = hashlib.md5()
+        vk=rt+'7oE9nPEG9xXV69phU31FYCLUagKeYtsF'+devid
+        hashvk.update(vk.encode('utf-8'))
+        vk = hashvk.hexdigest()
+        username = users[num]
+        password = passes[num]
+        rid=logServer.get('rid')
+        gid=''
+        msg='type@=loginreq'\
+        +'/username@='+username\
+        +'/ct@=0'\
+        +'/password@='+password\
+        +'/roomid@='+rid\
+        +'/devid@='+devid\
+        +'/rt@='+rt\
+        +'/vk@='+vk\
+        +'/ver@=20150929'\
+        +'/\x00'
+        print(msg)
+        sendmsg(sock[num],msg)
+        context=sock[num].recv(1024)
+        #print(context)
+
+        context=context.split(b'\xb2\x02')[1].decode('utf-8')
+        typeID1st=re.findall('type@=(.*?)/',context)[0]
+        if typeID1st != 'error' :
+            uid=re.findall('userid@=(\d+)',context)[0]
+            sucnum=sucnum+1
+            #print ("=======================success==============",sucnum)
+            #sendmsg(sock,msg)
+            context=sock[num].recv(1024)
+            #print(context)
+            danmuServer=danmuServerGet(context)
+            print (realname[num].decode('utf-8').encode('gb18030'))
+            print('group ID get:',danmuServer['gid'],"userid:",uid)
+        
+            msg='type@=qtlnq'\
+            +'/\x00'
+            sendmsg(sock[num],msg)
+
+            msg='type@=qrl'\
+            +'/rid@='+rid\
+            +'/\x00'
+            sendmsg(sock[num],msg)
+
+            msg='type@=reqog'\
+            +'/uid@='+uid\
+            +'/\x00'
+            sendmsg(sock[num],msg)
+
         else:
-            with open('bullet_curtain.jl', 'a') as f:
-                try:
-                    for i in danmu_more:
-                        dmDict={}
-                        dmDict['昵称'] = i[0].decode(encoding='utf-8', errors='ignore')
-                        dmDict['弹幕内容'] = i[1].decode(encoding='utf-8', errors='ignore')
-                        dmJsonStr = json.dumps(dmDict, ensure_ascii=False)+'\n'
-                        print(dmDict['昵称'])
-                        f.write(dmJsonStr)
-                        danmuNum = danmuNum + 1
-                except:
-                    continue
+            danmuServer=dict()
+        #sock.close()
+        #returnDict={'isError':typeID1st,'typeID':typeID2st,'gid':gid,,}
+    
+    cput=''
+    while cput!='$':
+        cput=raw_input("please input content($-exit):")
+        if cput!='$':
+            cput=cput.decode('gb18030').encode('utf-8')
+            conmsg='type@=chatmessage'\
+            +'/receiver@=0'\
+            +'/content@='+cput\
+            +'/scope@=/'\
+            +'col@=0/'\
+            +'\x00'
 
-def keeplive():
-    '''
-    发送心跳信息，维持TCP长连接
-    心跳消息末尾加入\0
-    '''
-    while True:
-        msg = 'type@=keeplive/tick@=' + str(int(time.time())) + '/\0'
-        sendmsg(msg)
-        time.sleep(10)
+            for i in range(len(users)):
+                sendmsg(sock[i],conmsg)
+
+    for i in range(len(users)):
+        sock[i].close()
+    
+    return danmuServer
+
+def keeplive(sock):
+    global whileCodition
+    print('===init keeplive===')
+    while whileCodition:
+        print('40sleep')
+        msg='type@=keeplive/tick@='+str(int(time.time()))+'/\x00'
+        sendmsg(sock,msg)
+        #keeplive=sock.recv(1024)
+        time.sleep(20)
+    sock.close()
 
 
-def get_name(roomid):
-    '''
-    利用BeautifulSoup获取直播间标题
-    '''
-    r = requests.get("http://www.douyu.com/" + roomid)
-    soup = BeautifulSoup(r.text, 'lxml')
-    return soup.find('a', {'class', 'zb-name'}).string
+def main(idolid):
+    logServer=staticGet(idolid)
+    danmuServer=dynamicGet(logServer)
 
-# 启动程序
-if __name__ == '__main__':
-    room_id = 252140
-    p1 = multiprocessing.Process(target=start, args=(room_id,))
-    p2 = multiprocessing.Process(target=keeplive)
-    p1.start()
-    p2.start()
+
+
+if __name__=='__main__':
+    # idolid= sys.argv[1] if len(sys.argv)>1 else 'saro'
+    # main(idolid)
+    server = staticGet('8517916')
+    print(server)
